@@ -1,0 +1,55 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model Document {
+  id                   String          @id @default(uuid())
+  fileName             String
+  filePath             String
+  documentCategory     String          // e.g., BILL, RECEIPT, STATEMENT
+  documentType         String?         // e.g., Medical, Grocery, etc
+  uploadDate           DateTime        @default(now())
+  // Document-level attributes (not repeated per line item)
+  merchant_or_provider String?
+  merchant_address     String?
+  paymentStatus        String?         @default("UNPAID") // UNPAID, PAID
+  dueDate              String?         // when the bill must be paid
+  patientName          String?         // for medical bills
+  rawJson              String?         // stores the raw JSON payload from Gemini
+  date                 String?         // Document level date
+  totalAmount          Float?          // Document level total amount
+  tax                  Float?          // Document level tax amount
+  extractedItems       ExtractedItem[]
+  sourceLinks          DocumentLink[]  @relation("SourceDocument")
+  targetLinks          DocumentLink[]  @relation("TargetDocument")
+}
+
+model ExtractedItem {
+  id          String   @id @default(uuid())
+  documentId  String
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  description String?
+  amount      Float?
+  quantity    Int      @default(1)
+  metadata    String?  // Stored as JSON string due to SQLite limitations
+}
+
+model DocumentLink {
+  id                 String   @id @default(uuid())
+  sourceDocumentId   String
+  sourceDocument     Document @relation("SourceDocument", fields: [sourceDocumentId], references: [id], onDelete: Cascade)
+  targetDocumentId   String
+  targetDocument     Document @relation("TargetDocument", fields: [targetDocumentId], references: [id], onDelete: Cascade)
+  relationshipType   String   // e.g., PAYS_FOR, APPEARS_ON_STATEMENT
+  confidenceScore    Float
+  isManuallyVerified Boolean  @default(false)
+  createdAt          DateTime @default(now())
+}
