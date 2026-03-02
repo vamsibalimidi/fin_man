@@ -22,8 +22,10 @@ If it's a RECEIPT or BILL:
 - return 'documentType': 'Medical', 'Grocery', 'Utility', 'Restaurant', 'Other'
 - return 'merchant_or_provider' name
 - return 'merchant_address' if available
-- return 'date'
+- return 'date' in YYYY-MM-DD format
+- return 'time' in HH:MM:SS format
 - return 'total_amount' (as number)
+- return 'number_of_items' (as number)
 - return 'tax' (as number, if applicable)
 - return 'paymentStatus' as 'PAID' or 'UNPAID' if it's a BILL (default to UNPAID if unsure)
 - For 'BILL', return 'dueDate' if found.
@@ -32,5 +34,5 @@ If it's a RECEIPT or BILL:
   - For each 'line_item', provide 'description', 'amount' (as number).
   - Also provide a 'metadata' JSON object inside the line_item containing any other specific fields like 'quantity', 'category', 'tax_indicator', 'procedure_code', etc.
   - As part of metadata, see if you can intelligently decipher the item's "descripton" field into more meaningful item_description and item_category and send back in response
-
+- if the number_of_items does not match the size of 'line_items', repeat the rescan and extraction process. Only do this 3 times and end of 3 times return what you have.
 Be precise with amounts (do not include currency symbols in the number fields).`;

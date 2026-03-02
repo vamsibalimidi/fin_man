@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
+import { isMerchantDuplicate } from "@/lib/normalization-utils";
 
 /**
  * POST /api/linker
@@ -21,7 +22,7 @@ export async function POST() {
             include: { extractedItems: true },
         });
 
-        const bills = allDocuments.filter((d) => d.documentCategory === "BILL");
+        const bills = allDocuments.filter((d) => d.documentCategory === "BILL" && d.paymentStatus !== "PAID");
         const receipts = allDocuments.filter((d) => d.documentCategory === "RECEIPT");
         const statements = allDocuments.filter((d) => d.documentCategory === "STATEMENT");
 
@@ -29,20 +30,31 @@ export async function POST() {
 
         // --- Pass 1: Match RECEIPTS to BILLS ---
         for (const receipt of receipts) {
-            if (!receipt.extractedItems || receipt.extractedItems.length === 0) continue;
+            // Get Receipt Total: Prioritize explicitly confirmed totalAmount, fallback to line items sum
+            const receiptTotal = receipt.totalAmount ?? (receipt.extractedItems?.reduce((sum, i) => sum + (i.amount || 0), 0) || 0);
+            if (receiptTotal === 0) continue;
 
-            const receiptTotal = receipt.extractedItems.reduce((sum: number, i) => sum + (i.amount || 0), 0);
             const receiptDate = new Date((receipt as any).date || receipt.uploadDate);
 
             for (const bill of bills) {
-                if (!bill.extractedItems || bill.extractedItems.length === 0) continue;
+                // Check if they are already linked
+                // (Optimization: we could check this outside the nested loop if we pre-fetched links, 
+                // but for now we'll do it inside or just rely on the existing link check below)
 
-                const billNetTotal = bill.extractedItems.reduce((sum: number, i) => sum + (i.amount || 0), 0);
+                // Verify Merchant Match first to save processing
+                const isMerchantMatch = isMerchantDuplicate(receipt.merchant_or_provider || "", bill.merchant_or_provider || "");
+                if (!isMerchantMatch) continue;
+
+                // Get Bill Total: Prioritize explicitly confirmed totalAmount, fallback to line items sum
+                const billNetTotal = bill.totalAmount ?? (bill.extractedItems?.reduce((sum, i) => sum + (i.amount || 0), 0) || 0);
+                if (billNetTotal === 0) continue;
+
                 const billDate = new Date((bill as any).date || bill.uploadDate);
 
                 if (Math.abs(billNetTotal - receiptTotal) < 0.05) {
                     const daysDiff = (receiptDate.getTime() - billDate.getTime()) / (1000 * 3600 * 24);
 
+                    // Allow reasonable window for payment (45 days)
                     if (daysDiff >= -45 && daysDiff <= 45) {
                         const existing = await prisma.documentLink.findFirst({
                             where: {
@@ -58,11 +70,11 @@ export async function POST() {
                                     sourceDocumentId: receipt.id,
                                     targetDocumentId: bill.id,
                                     relationshipType: "PAYS_FOR",
-                                    confidenceScore: 0.85
+                                    confidenceScore: 0.95 // Increased due to merchant matching
                                 }
                             });
 
-                            // Update the bill Document's paymentStatus (not ExtractedItem)
+                            // Update the bill Document's paymentStatus
                             await prisma.document.update({
                                 where: { id: bill.id },
                                 data: { paymentStatus: "PAID" }
@@ -81,7 +93,9 @@ export async function POST() {
 
             for (const transaction of statement.extractedItems) {
                 const txAmount = transaction.amount || 0;
-                const txDate = new Date((transaction as any).date || statement.uploadDate);
+                // Prioritize transaction-level date, then document date, then upload date
+                const txDateRaw = (transaction as any).date || statement.date || statement.uploadDate;
+                const txDate = new Date(txDateRaw);
 
                 for (const receipt of receipts) {
                     if (!receipt.extractedItems || receipt.extractedItems.length === 0) continue;

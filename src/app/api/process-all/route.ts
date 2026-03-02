@@ -4,14 +4,19 @@ import { prisma } from "@/lib/db";
 import { GEMINI_PROMPT } from "@/lib/prompt";
 import fs from "fs/promises";
 import path from "path";
+import { calculateHash } from "@/lib/hash-utils";
+import { isMerchantDuplicate, generateNormalizedFilename } from "@/lib/normalization-utils";
+import { detectConflict } from "@/lib/conflict-utils";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || "");
 const UPLOADS_DIR = path.join(process.cwd(), "public/uploads");
 const PROCESSED_DIR = path.join(process.cwd(), "public/processed");
+const CONFLICTS_DIR = path.join(process.cwd(), "public/conflicts");
 
 export async function POST(req: NextRequest) {
     try {
         await fs.mkdir(PROCESSED_DIR, { recursive: true });
+        await fs.mkdir(CONFLICTS_DIR, { recursive: true });
 
         // Try to parse specific file names from the request body if provided
         let requestedFiles: string[] = [];
@@ -42,13 +47,51 @@ export async function POST(req: NextRequest) {
 
         let successCount = 0;
         let errors = [];
+        const seenHashes = new Set<string>(); // Tracker for deduplication within the current batch
 
         // 2. Loop through and process each one
         for (const fileName of filesToProcess) {
             try {
                 const filePath = path.join(UPLOADS_DIR, fileName);
                 const buffer = await fs.readFile(filePath);
+                const fileHash = calculateHash(buffer);
 
+                // 1. Phase 1: Hash Collision Check (Database + Current Batch)
+                const hashConflict = await detectConflict(fileHash, {});
+                if (hashConflict || seenHashes.has(fileHash)) {
+                    const conflictPath = path.join(CONFLICTS_DIR, fileName);
+                    await fs.rename(filePath, conflictPath);
+
+                    const errorMsg = seenHashes.has(fileHash)
+                        ? "Duplicate of another file in this batch"
+                        : (hashConflict?.message || "Exact file duplicate detected");
+
+                    const conflictMatches = hashConflict?.matches || [];
+
+                    await (prisma as any).conflict.create({
+                        data: {
+                            fileName,
+                            filePath: `/conflicts/${fileName}`,
+                            type: "HASH_COLLISION",
+                            error: errorMsg,
+                            extractedData: "{}",
+                            matches: JSON.stringify(conflictMatches)
+                        }
+                    });
+
+                    errors.push({
+                        fileName,
+                        type: "HASH_COLLISION",
+                        error: errorMsg,
+                        matches: conflictMatches
+                    });
+                    continue;
+                }
+
+                // Mark this hash as seen so we don't process it again in this batch
+                seenHashes.add(fileHash);
+
+                // 2. Extract Data using Gemini
                 let mimeType = "application/octet-stream";
                 if (fileName.toLowerCase().endsWith(".pdf")) mimeType = "application/pdf";
                 else if (fileName.toLowerCase().match(/\.(jpg|jpeg)$/)) mimeType = "image/jpeg";
@@ -65,84 +108,135 @@ export async function POST(req: NextRequest) {
                 const text = (await result.response).text();
                 const extractedData = JSON.parse(text);
 
-                // 3. Commit exactly like the manual commit route does
+                // 3. Phase 2: Metadata Collision Check (using same centralized logic)
+                const metaConflict = await detectConflict(fileHash, extractedData);
+                if (metaConflict && metaConflict.type !== "HASH_COLLISION") {
+                    const conflictPath = path.join(CONFLICTS_DIR, fileName);
+                    await fs.rename(filePath, conflictPath);
+
+                    await (prisma as any).conflict.create({
+                        data: {
+                            fileName,
+                            filePath: `/conflicts/${fileName}`,
+                            type: metaConflict.type,
+                            error: metaConflict.message,
+                            extractedData: text,
+                            matches: JSON.stringify(metaConflict.matches)
+                        }
+                    });
+
+                    errors.push({
+                        fileName,
+                        type: metaConflict.type,
+                        error: metaConflict.message,
+                        matches: metaConflict.matches
+                    });
+                    continue;
+                }
+
+                // 4. No collisions - Commit
                 const items = (extractedData.line_items && extractedData.line_items.length > 0)
                     ? extractedData.line_items
                     : (extractedData.transactions || []);
 
-                const newPath = path.join(PROCESSED_DIR, fileName);
-                await fs.rename(filePath, newPath);
+                // Sanitize numeric totals
+                const sanitizeNum = (val: any) => {
+                    if (val === undefined || val === null || val === "") return null;
+                    const parsed = parseFloat(String(val).replace(/[^0-9.-]+/g, ""));
+                    return isNaN(parsed) ? null : parsed;
+                };
 
-                const finalUrlPath = `/processed/${fileName}`;
+                const totalAmount = sanitizeNum(extractedData.total_amount);
 
-                const dbDoc = await prisma.document.create({
-                    data: {
-                        fileName: fileName,
-                        filePath: finalUrlPath,
-                        documentCategory: extractedData.documentCategory || "OTHER",
-                        documentType: extractedData.documentType || "Other",
-                        merchant_or_provider: extractedData.merchant_or_provider || null,
-                        merchant_address: extractedData.merchant_address || null,
-                        paymentStatus: extractedData.paymentStatus || null,
-                        dueDate: extractedData.dueDate ? new Date(extractedData.dueDate) : null,
-                        patientName: extractedData.patientName || null,
-                        rawJson: JSON.stringify(extractedData),
-                        date: extractedData.date ?? null,
-                        totalAmount: (extractedData.total_amount !== undefined && extractedData.total_amount !== null && extractedData.total_amount !== "") ? parseFloat(String(extractedData.total_amount).replace(/[^0-9.-]+/g, "")) : null,
-                        tax: (extractedData.tax !== undefined && extractedData.tax !== null && extractedData.tax !== "") ? parseFloat(String(extractedData.tax).replace(/[^0-9.-]+/g, "")) : null,
-                    } as any
+                // Generate Normalized Filename
+                let finalFileName = generateNormalizedFilename({
+                    date: extractedData.date,
+                    merchant: extractedData.merchant_or_provider,
+                    category: extractedData.documentCategory,
+                    originalName: fileName
                 });
 
-                await Promise.all(items.map((item: any) => {
-                    let parsedAmount = null;
-                    if (item.amount !== undefined && item.amount !== null) {
-                        parsedAmount = typeof item.amount === 'string'
-                            ? parseFloat(item.amount.replace(/[^0-9.-]+/g, ""))
-                            : Number(item.amount);
-                    }
+                const processedDir = path.join(process.cwd(), "public", "processed");
+                let uniqueName = finalFileName;
+                let counter = 1;
+                const lastDotIndex = finalFileName.lastIndexOf(".");
+                const base = lastDotIndex !== -1 ? finalFileName.substring(0, lastDotIndex) : finalFileName;
+                const extSuffix = lastDotIndex !== -1 ? finalFileName.substring(lastDotIndex) : "";
 
-                    let parsedQty = 1;
-                    const rawQty = item.quantity || item.metadata?.quantity;
-                    if (rawQty !== undefined && rawQty !== null) {
-                        parsedQty = typeof rawQty === 'string'
-                            ? parseInt(rawQty.replace(/[^0-9-]+/g, ""))
-                            : Number(rawQty);
+                while (true) {
+                    try {
+                        await fs.access(path.join(processedDir, uniqueName));
+                        uniqueName = `${base}-${counter}${extSuffix}`;
+                        counter++;
+                    } catch {
+                        break;
                     }
+                }
+                finalFileName = uniqueName;
+                const newPath = path.join(processedDir, finalFileName);
 
-                    return prisma.extractedItem.create({
+                await fs.rename(filePath, newPath);
+                const finalUrlPath = `/processed/${finalFileName}`;
+
+                try {
+                    await (prisma as any).document.create({
                         data: {
-                            documentId: dbDoc.id,
-                            description: item.description,
-                            amount: (typeof parsedAmount === 'number' && !isNaN(parsedAmount)) ? parsedAmount : null,
-                            quantity: (typeof parsedQty === 'number' && !isNaN(parsedQty)) ? parsedQty : 1,
-                            metadata: item.metadata ? JSON.stringify(item.metadata) : null,
-                        } as any
+                            fileName: finalFileName,
+                            filePath: finalUrlPath,
+                            documentCategory: extractedData.documentCategory,
+                            documentType: extractedData.documentType,
+                            merchant_or_provider: extractedData.merchant_or_provider ?? null,
+                            merchant_address: extractedData.merchant_address ?? null,
+                            paymentStatus: extractedData.paymentStatus || "UNPAID",
+                            dueDate: extractedData.dueDate ?? null,
+                            patientName: extractedData.patientName ?? null,
+                            rawJson: text,
+                            date: extractedData.date ?? null,
+                            totalAmount: totalAmount,
+                            hash: fileHash,
+                            extractedItems: {
+                                create: items.map((item: any) => ({
+                                    description: item.description || "No description",
+                                    amount: sanitizeNum(item.amount),
+                                    category: item.category || "Uncategorized",
+                                    type: item.type || "EXPENSE",
+                                    date: item.date || extractedData.date || null,
+                                    merchant: item.merchant || extractedData.merchant_or_provider || null,
+                                }))
+                            }
+                        }
                     });
-                }));
+                } catch (dbError) {
+                    // CRITICAL: If DB write fails, we MUST remove the renamed file
+                    // or it will orphan in the processed folder and cause suffixing bugs later.
+                    try { await fs.unlink(newPath); } catch (unlinkErr) { console.error("Failed to cleanup orphaned file:", unlinkErr); }
+                    throw dbError;
+                }
 
                 successCount++;
             } catch (err: any) {
-                console.error(`Failed auto-process for ${fileName}:`, err);
-                errors.push({ fileName, error: err.message });
+                console.error(`Failed to process ${fileName}:`, err);
+                errors.push({ fileName, error: err.message || "Unknown error" });
             }
         }
 
-        // 4. Run the Auto-Linker to reconcile the new documents
-        try {
-            const baseUrl = req.nextUrl.origin;
-            await fetch(`${baseUrl}/api/linker`, { method: "POST" }).catch(e => console.error("Linker background failure:", e));
-        } catch (e) {
-            console.error("Failed to trigger auto-linker from process-all", e);
+        // 4. Trigger Linker if any files were successfully processed
+        if (successCount > 0) {
+            fetch(`${new URL(req.url).origin}/api/linker`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" }
+            }).catch(err => console.error("Linker trigger failed during batch:", err));
         }
 
         return NextResponse.json({
             success: true,
-            processedCount: successCount,
-            errors: errors.length > 0 ? errors : undefined
+            total: filesToProcess.length,
+            successCount,
+            errors
         });
 
     } catch (error: any) {
-        console.error("Process all error:", error);
-        return NextResponse.json({ error: "Failed to run process-all job" }, { status: 500 });
+        console.error("Batch process error:", error);
+        return NextResponse.json({ error: error.message }, { status: 500 });
     }
 }

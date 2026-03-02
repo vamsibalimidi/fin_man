@@ -1,11 +1,10 @@
 import { PrismaClient } from "@prisma/client";
-
 /**
  * Database Instantiation Utility
  * 
  * In development, Next.js clears the Node cache on every file change. 
- * If we instantiate a new PrismaClient normally, hot-reloading will rapidly exhaust 
- * the database connection pool. 
+ * If we instantiate a new PrismaClient normally, hot - reloading will rapidly exhaust
+    * the database connection pool. 
  * 
  * To solve this, we cache the PrismaClient instance on the `globalThis` object.
  * This ensures only ONE connection is reused across the entire development session.

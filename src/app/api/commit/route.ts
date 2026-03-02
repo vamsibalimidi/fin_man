@@ -2,110 +2,162 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import fs from "fs/promises";
 import path from "path";
+import { calculateHash } from "@/lib/hash-utils";
+import { isMerchantDuplicate, generateNormalizedFilename } from "@/lib/normalization-utils";
+import { detectConflict } from "@/lib/conflict-utils";
 
 /**
  * POST /api/commit
  * 
  * Invoked by the Human-In-The-Loop review modal.
- * 
- * 1. Takes the user-approved JSON payload and the physical file's staging location.
- * 2. Physically moves the file from `public/uploads/` (staging) to `public/processed/` (permanent).
- * 3. Maps the structured JSON exactly to the Prisma SQLite schema, converting numeric strings 
- *    (like "$40.00") into true floats.
- * 4. Asynchronously triggers the `/api/linker` route in the background so the user doesn't have 
- *    to wait for the relational engine algorithms to finish before the modal closes.
  */
 export async function POST(req: NextRequest) {
     try {
         const body = await req.json();
-        const { fileMeta, extractedData } = body;
+        const { fileMeta, extractedData, force = false, customFileName = null } = body;
 
         if (!fileMeta || !extractedData) {
-            return NextResponse.json(
-                { error: "Missing required payload" },
-                { status: 400 }
-            );
+            return NextResponse.json({ error: "Missing required payload" }, { status: 400 });
         }
 
         const items = (extractedData.line_items && extractedData.line_items.length > 0)
             ? extractedData.line_items
             : (extractedData.transactions || []);
 
-        // Move file from uploads/ staging to processed/
-        const oldPath = path.join(process.cwd(), "public", "uploads", fileMeta.fileName);
-        const newPath = path.join(process.cwd(), "public", "processed", fileMeta.fileName);
+        const processedDir = path.join(process.cwd(), "public", "processed");
+        await fs.mkdir(processedDir, { recursive: true });
 
+        // 1. Resolve source file path (could be in uploads or conflicts)
+        let oldPath = path.join(process.cwd(), "public", "uploads", fileMeta.fileName);
+        if (fileMeta.filePath && fileMeta.filePath.startsWith("/conflicts/")) {
+            oldPath = path.join(process.cwd(), "public", fileMeta.filePath);
+        }
+
+        // 1. Calculate Hash
+        const fileBuffer = await fs.readFile(oldPath);
+        const fileHash = calculateHash(fileBuffer);
+
+        // 2. Check for Conflicts (Metadata/Hash) unless forced
+        if (!force) {
+            const conflict = await detectConflict(fileHash, extractedData);
+            if (conflict) {
+                return NextResponse.json({
+                    error: conflict.message,
+                    type: conflict.type,
+                    matches: conflict.matches
+                }, { status: 409 });
+            }
+
+            // Also check for name collision if a custom name was provided
+            if (customFileName) {
+                try {
+                    await fs.access(path.join(processedDir, customFileName));
+                    return NextResponse.json({
+                        error: "A file with this name already exists. Please choose a different name or force save.",
+                        type: "NAME_COLLISION"
+                    }, { status: 409 });
+                } catch {
+                    // Not found, proceed
+                }
+            }
+        }
+
+        // 3. Generate Final Filename
+        let finalFileName = customFileName || generateNormalizedFilename({
+            date: extractedData.date,
+            merchant: extractedData.merchant_or_provider,
+            category: extractedData.documentCategory,
+            originalName: fileMeta.fileName
+        });
+
+        // Always ensure unique name in processed directory unless the user MANUALLY chose a name AND opted to overwrite
+        // For our "Keep Both (Copy)" flow, force is true, so we should always auto-suffix if taken.
+        let uniqueName = finalFileName;
+        let counter = 1;
+        const lastDotIndex = finalFileName.lastIndexOf(".");
+        const base = lastDotIndex !== -1 ? finalFileName.substring(0, lastDotIndex) : finalFileName;
+        const ext = lastDotIndex !== -1 ? finalFileName.substring(lastDotIndex) : "";
+
+        while (true) {
+            try {
+                await fs.access(path.join(processedDir, uniqueName));
+                // If it exists, we must suffix it
+                uniqueName = `${base}-${counter}${ext}`;
+                counter++;
+            } catch {
+                break;
+            }
+        }
+
+        finalFileName = uniqueName;
+        const newPath = path.join(processedDir, finalFileName);
+
+        // 4. Move file
         try {
             await fs.rename(oldPath, newPath);
         } catch (e: any) {
             console.error("Failed to move file to processed directory:", e);
-            // We ignore ENOENT strictly to allow committing even if the file was somehow already moved or missing.
             if (e.code !== "ENOENT") throw e;
         }
 
-        const finalUrlPath = `/processed/${fileMeta.fileName}`;
+        // 5. Database Entry
+        const sanitizeNum = (val: any) => {
+            if (val === undefined || val === null || val === "") return null;
+            const parsed = parseFloat(String(val).replace(/[^0-9.-]+/g, ""));
+            return isNaN(parsed) ? null : parsed;
+        };
 
-        const dbDoc = await prisma.document.create({
-            data: {
-                fileName: fileMeta.fileName,
-                filePath: finalUrlPath,
-                documentCategory: extractedData.documentCategory,
-                documentType: extractedData.documentType,
-                // Document-level fields (belong on the document, not per line item)
-                merchant_or_provider: extractedData.merchant_or_provider ?? null,
-                merchant_address: extractedData.merchant_address ?? null,
-                paymentStatus: extractedData.paymentStatus || "UNPAID",
-                dueDate: extractedData.dueDate ?? null,
-                patientName: extractedData.patientName ?? null,
-                rawJson: JSON.stringify(extractedData),
-                date: extractedData.date ?? null,
-                totalAmount: (extractedData.total_amount !== undefined && extractedData.total_amount !== null && extractedData.total_amount !== "") ? parseFloat(String(extractedData.total_amount).replace(/[^0-9.-]+/g, "")) : null,
-                tax: (extractedData.tax !== undefined && extractedData.tax !== null && extractedData.tax !== "") ? parseFloat(String(extractedData.tax).replace(/[^0-9.-]+/g, "")) : null,
-                // Line items — clean, purely transactional data
-                extractedItems: {
-                    create: items.map((item: any) => {
-                        let parsedAmount = null;
-                        if (item.amount !== undefined && item.amount !== null) {
-                            parsedAmount = typeof item.amount === 'string'
-                                ? parseFloat(item.amount.replace(/[^0-9.-]+/g, ""))
-                                : Number(item.amount);
-                        }
+        const totalAmount = sanitizeNum(extractedData.total_amount);
 
-                        let parsedQty = 1;
-                        const rawQty = item.quantity || item.metadata?.quantity;
-                        if (rawQty !== undefined && rawQty !== null) {
-                            parsedQty = typeof rawQty === 'string'
-                                ? parseInt(rawQty.replace(/[^0-9-]+/g, ""))
-                                : Number(rawQty);
-                        }
+        const finalUrlPath = `/processed/${finalFileName}`;
 
-                        return {
-                            description: item.description,
-                            amount: (typeof parsedAmount === 'number' && !isNaN(parsedAmount)) ? parsedAmount : null,
-                            quantity: (typeof parsedQty === 'number' && !isNaN(parsedQty)) ? parsedQty : 1,
-                            metadata: item.metadata ? JSON.stringify(item.metadata) : null,
-                        };
-                    }),
-                }
-            } as any,
-            include: { extractedItems: true }
-        });
-
-        // Fire the Linker asynchronously
+        let dbDoc;
         try {
-            const baseUrl = req.nextUrl.origin;
-            fetch(`${baseUrl}/api/linker`, { method: "POST" }).catch(e => console.error("Linker background failure:", e));
-        } catch (e) {
-            console.error("Failed to trigger auto-linker from manual commit", e);
+            dbDoc = await (prisma.document as any).create({
+                data: {
+                    fileName: finalFileName,
+                    filePath: finalUrlPath,
+                    documentCategory: extractedData.documentCategory,
+                    documentType: extractedData.documentType,
+                    merchant_or_provider: extractedData.merchant_or_provider ?? null,
+                    merchant_address: extractedData.merchant_address ?? null,
+                    paymentStatus: extractedData.paymentStatus || "UNPAID",
+                    dueDate: extractedData.dueDate ?? null,
+                    patientName: extractedData.patientName ?? null,
+                    rawJson: JSON.stringify(extractedData),
+                    date: extractedData.date ?? null,
+                    totalAmount: totalAmount,
+                    tax: sanitizeNum(extractedData.tax),
+                    hash: fileHash,
+                    extractedItems: {
+                        create: items.map((item: any) => ({
+                            description: item.description || "No description",
+                            amount: sanitizeNum(item.amount),
+                            category: item.category || "Uncategorized",
+                            type: item.type || "EXPENSE",
+                            date: item.date || extractedData.date || null,
+                            merchant: item.merchant || extractedData.merchant_or_provider || null,
+                        }))
+                    }
+                }
+            });
+        } catch (dbError) {
+            // CRITICAL: Cleanup orphaned file if DB creation fails
+            try { await fs.unlink(newPath); } catch (unlinkErr) { console.error("Failed to cleanup orphaned file:", unlinkErr); }
+            throw dbError;
         }
+
+        // Trigger linker
+        fetch(`${new URL(req.url).origin}/api/linker`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ documentId: dbDoc.id })
+        }).catch(err => console.error("Linker trigger failed:", err));
 
         return NextResponse.json({ success: true, document: dbDoc });
 
     } catch (error: any) {
         console.error("Commit error:", error);
-        return NextResponse.json(
-            { error: "Failed to save document to database", details: error?.message || String(error) },
-            { status: 500 }
-        );
+        return NextResponse.json({ error: error.message }, { status: 500 });
     }
 }

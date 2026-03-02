@@ -27,9 +27,11 @@ model Document {
   date                 String?         // Document level date
   totalAmount          Float?          // Document level total amount
   tax                  Float?          // Document level tax amount
+  hash                 String?         // SHA-256 file hash for duplicate detection
   extractedItems       ExtractedItem[]
   sourceLinks          DocumentLink[]  @relation("SourceDocument")
   targetLinks          DocumentLink[]  @relation("TargetDocument")
+  @@index([hash])
 }
 
 model ExtractedItem {
@@ -38,7 +40,11 @@ model ExtractedItem {
   document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
   description String?
   amount      Float?
+  date        String?  // For statement transactions
   quantity    Int      @default(1)
+  category    String?  // e.g., Grocery, Medical, etc
+  type        String?  // e.g., TRANSACTION, SERVICE
+  merchant    String?  // Merchant for this specific item
   metadata    String?  // Stored as JSON string due to SQLite limitations
 }
 
@@ -52,4 +58,15 @@ model DocumentLink {
   confidenceScore    Float
   isManuallyVerified Boolean  @default(false)
   createdAt          DateTime @default(now())
+}
+
+model Conflict {
+  id            String   @id @default(uuid())
+  fileName      String
+  filePath      String
+  type          String   // HASH_COLLISION or METADATA_COLLISION
+  error         String
+  extractedData String   // Raw JSON from Gemini
+  matches       String   // JSON array of matching document info
+  createdAt     DateTime @default(now())
 }

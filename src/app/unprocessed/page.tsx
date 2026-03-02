@@ -1,20 +1,30 @@
 "use client"
 
 import { useState, useRef, useEffect, useCallback } from "react"
-import { Upload, FileText, CheckCircle2, Loader2, Play, RefreshCw, CalendarIcon, Zap, Trash2 } from "lucide-react"
+import { Upload, FileText, CheckCircle2, Loader2, Play, RefreshCw, CalendarIcon, Zap, Trash2, AlertTriangle, ArrowRight, ChevronDown, ChevronUp, AlertCircle } from "lucide-react"
+import Link from "next/link"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { ExtractionReview } from "@/components/extraction-review"
 import { Badge } from "@/components/ui/badge"
-import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog"
 import { Checkbox } from "@/components/ui/checkbox"
 import { DocumentViewerSheet, useDocumentViewer } from "@/components/document-viewer-sheet"
+import { FileIcon } from "@/components/file-icon"
+import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogHeader, DialogFooter } from "@/components/ui/dialog"
 
 interface StagingFile {
     fileName: string
     filePath: string
     size: number
     createdAt: string
+    isDuplicate?: boolean
+    duplicateId?: string
+}
+
+interface FileMeta {
+    fileName: string
+    filePath: string
+    mimeType: string
 }
 
 /**
@@ -30,6 +40,7 @@ interface StagingFile {
 export default function UnprocessedPage() {
     // Staging List state
     const [files, setFiles] = useState<StagingFile[]>([])
+    const [conflictCount, setConflictCount] = useState(0)
     const [isLoadingFiles, setIsLoadingFiles] = useState(true)
     const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set())
 
@@ -45,12 +56,22 @@ export default function UnprocessedPage() {
     const [isExtracting, setIsExtracting] = useState<string | null>(null) // holds fileName being extracted
     const [isDeleting, setIsDeleting] = useState<string | null>(null) // holds fileName being deleted
     const [reviewData, setReviewData] = useState<any | null>(null)
-    const [fileMeta, setFileMeta] = useState<any | null>(null)
+    const [reviewConflict, setReviewConflict] = useState<any | null>(null)
+    const [fileMeta, setFileMeta] = useState<FileMeta | null>(null)
 
     // Auto-Process state
     const [isAutoProcessing, setIsAutoProcessing] = useState(false)
     const [autoProcessStatus, setAutoProcessStatus] = useState<string>("")
     const [progress, setProgress] = useState<{ current: number, total: number } | null>(null)
+    const [batchSummary, setBatchSummary] = useState<{
+        total: number,
+        success: number,
+        duplicates: number,
+        conflicts: number,
+        errors: number,
+        errorDetails?: { fileName: string, error: string }[]
+    } | null>(null)
+    const [showErrorDetails, setShowErrorDetails] = useState(false)
 
     const fetchFiles = useCallback(async () => {
         setIsLoadingFiles(true)
@@ -58,7 +79,27 @@ export default function UnprocessedPage() {
             const res = await fetch("/api/unprocessed")
             const data = await res.json()
             if (res.ok) {
-                setFiles(data.files || [])
+                const filesWithDupes = await Promise.all((data.files || []).map(async (file: StagingFile) => {
+                    try {
+                        const dupeRes = await fetch("/api/check-duplicate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ fileName: file.fileName })
+                        });
+                        const dupeData = await dupeRes.json();
+                        return { ...file, isDuplicate: dupeData.duplicate, duplicateId: dupeData.existingId };
+                    } catch (e) {
+                        return file;
+                    }
+                }));
+                setFiles(filesWithDupes)
+            }
+
+            // Also fetch conflict count
+            const confRes = await fetch("/api/conflicts")
+            if (confRes.ok) {
+                const confData = await confRes.json()
+                setConflictCount(confData.length || 0)
             }
         } catch (error) {
             console.error(error)
@@ -129,6 +170,7 @@ export default function UnprocessedPage() {
             if (!res.ok) throw new Error(data.error)
 
             setReviewData(data.extractedData)
+            setReviewConflict(data.conflict)
             setFileMeta(data.fileMeta)
         } catch (error) {
             console.error("Extraction failed:", error)
@@ -171,6 +213,12 @@ export default function UnprocessedPage() {
         const total = filesToProcess.length;
         setProgress({ current: 0, total });
 
+        let successCount = 0;
+        let duplicateCount = 0;
+        let conflictCount = 0;
+        let errorCount = 0;
+        let errorDetails: { fileName: string, error: string }[] = [];
+
         try {
             for (let i = 0; i < filesToProcess.length; i++) {
                 const file = filesToProcess[i];
@@ -183,7 +231,23 @@ export default function UnprocessedPage() {
                     body: JSON.stringify({ fileName: file.fileName })
                 });
 
-                if (!res.ok) {
+                const result = await res.json();
+
+                if (res.ok) {
+                    if (result.errors && result.errors.length > 0) {
+                        const err = result.errors[0];
+                        if (err.type === "HASH_COLLISION") duplicateCount++;
+                        else if (err.type === "METADATA_COLLISION" || err.type === "SOFT_MATCH") conflictCount++;
+                        else {
+                            errorCount++;
+                            errorDetails.push({ fileName: file.fileName, error: err.error || "Unknown error" });
+                        }
+                    } else {
+                        successCount++;
+                    }
+                } else {
+                    errorCount++;
+                    errorDetails.push({ fileName: file.fileName, error: result.error || "Auto-process failed" });
                     console.error("Auto-process failed for", file.fileName);
                 }
 
@@ -195,6 +259,15 @@ export default function UnprocessedPage() {
                 })
                 await fetchFiles();
             }
+
+            setBatchSummary({
+                total,
+                success: successCount,
+                duplicates: duplicateCount,
+                conflicts: conflictCount,
+                errors: errorCount,
+                errorDetails
+            });
         } catch (error) {
             console.error("Process all error:", error)
         } finally {
@@ -217,6 +290,80 @@ export default function UnprocessedPage() {
     return (
         <>
             <DocumentViewerSheet open={!!viewerFile} filePath={viewerFile?.path ?? null} fileName={viewerFile?.name ?? null} onClose={closeViewer} />
+
+            {/* Batch Summary Dialog */}
+            <Dialog open={!!batchSummary} onOpenChange={(open) => !open && setBatchSummary(null)}>
+                <DialogContent className="sm:max-w-md bg-background/95 backdrop-blur-md border-white/10 shadow-2xl">
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2">
+                            <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+                            Batch Process Complete
+                        </DialogTitle>
+                        <DialogDescription>
+                            Finished processing {batchSummary?.total} documents.
+                        </DialogDescription>
+                    </DialogHeader>
+
+                    <div className="grid grid-cols-2 gap-4 py-4">
+                        <div className="bg-emerald-500/10 border border-emerald-500/20 p-3 rounded-lg text-center">
+                            <div className="text-2xl font-bold text-emerald-500">{batchSummary?.success}</div>
+                            <div className="text-[10px] uppercase tracking-wider text-emerald-500/70 font-bold">Imported</div>
+                        </div>
+                        <div className="bg-amber-500/10 border border-amber-500/20 p-3 rounded-lg text-center">
+                            <div className="text-2xl font-bold text-amber-500">{batchSummary?.duplicates}</div>
+                            <div className="text-[10px] uppercase tracking-wider text-amber-500/70 font-bold">Files Skipped</div>
+                        </div>
+                        <div className="bg-blue-500/10 border border-blue-500/20 p-3 rounded-lg text-center">
+                            <div className="text-2xl font-bold text-blue-500">{batchSummary?.conflicts}</div>
+                            <div className="text-[10px] uppercase tracking-wider text-blue-500/70 font-bold">Metadata Conflicts</div>
+                        </div>
+                        <div className="bg-red-500/10 border border-red-500/20 p-3 rounded-lg text-center">
+                            <div className="text-2xl font-bold text-red-500">{batchSummary?.errors}</div>
+                            <div className="text-[10px] uppercase tracking-wider text-red-500/70 font-bold">Failed</div>
+                        </div>
+                    </div>
+
+                    {batchSummary?.errors && batchSummary.errors > 0 && (
+                        <div className="mb-4">
+                            <Button
+                                variant="ghost"
+                                size="sm"
+                                className="w-full justify-between text-xs text-muted-foreground hover:text-foreground p-0 h-auto"
+                                onClick={() => setShowErrorDetails(!showErrorDetails)}
+                            >
+                                <span className="flex items-center gap-2">
+                                    <AlertCircle className="h-3 w-3 text-red-500" />
+                                    {showErrorDetails ? "Hide Error Details" : `View ${batchSummary.errors} Failure Cause${batchSummary.errors > 1 ? 's' : ''}`}
+                                </span>
+                                {showErrorDetails ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                            </Button>
+                            {showErrorDetails && (
+                                <div className="mt-2 max-h-[150px] overflow-y-auto border rounded-md bg-red-500/5 border-red-500/10 divide-y divide-red-500/10">
+                                    {batchSummary.errorDetails?.map((err, i) => (
+                                        <div key={i} className="p-2 text-[10px] space-y-0.5">
+                                            <div className="font-bold text-red-500 truncate">{err.fileName}</div>
+                                            <div className="text-muted-foreground italic leading-tight">{err.error}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    <DialogFooter className="flex-col sm:flex-row gap-2">
+                        {batchSummary && (batchSummary.conflicts > 0 || batchSummary.duplicates > 0) && (
+                            <Button asChild variant="outline" className="w-full sm:w-auto border-blue-500/50 text-blue-500 hover:bg-blue-500/10 gap-2">
+                                <Link href="/conflicts">
+                                    Review Conflicts <ArrowRight className="h-4 w-4" />
+                                </Link>
+                            </Button>
+                        )}
+                        <Button onClick={() => { setBatchSummary(null); setShowErrorDetails(false); }} className="w-full sm:w-auto font-bold">
+                            Done
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
             <Dialog open={!!(reviewData && fileMeta)} onOpenChange={(open) => {
                 if (!open) { setReviewData(null); setFileMeta(null); fetchFiles(); }
             }}>
@@ -231,14 +378,17 @@ export default function UnprocessedPage() {
                         <div className="flex-1 overflow-y-auto p-2 sm:p-6 w-full h-full">
                             <ExtractionReview
                                 initialData={reviewData}
-                                fileMeta={fileMeta}
+                                fileMeta={fileMeta!}
+                                initialConflict={reviewConflict}
                                 onCommitSuccess={() => {
                                     setReviewData(null)
+                                    setReviewConflict(null)
                                     setFileMeta(null)
                                     fetchFiles()
                                 }}
                                 onCancel={() => {
                                     setReviewData(null)
+                                    setReviewConflict(null)
                                     setFileMeta(null)
                                 }}
                             />
@@ -275,6 +425,15 @@ export default function UnprocessedPage() {
                             <RefreshCw className={`h-4 w-4 ${isLoadingFiles ? "animate-spin" : ""}`} />
                             Refresh
                         </Button>
+                        {conflictCount > 0 && (
+                            <Button asChild variant="outline" size="sm" className="gap-2 border-amber-500/50 text-amber-500 hover:bg-amber-500/10">
+                                <Link href="/conflicts" className="flex items-center gap-2">
+                                    <AlertTriangle className="h-4 w-4" />
+                                    Conflict Queue
+                                    <Badge variant="secondary" className="bg-amber-500/20 text-amber-500 border-none h-4 px-1 text-[10px]">{conflictCount}</Badge>
+                                </Link>
+                            </Button>
+                        )}
                     </div>
                 </div>
 
@@ -318,8 +477,15 @@ export default function UnprocessedPage() {
                                                         className="h-5 w-5 rounded-sm"
                                                     />
                                                 </div>
-                                                <button onClick={() => openViewer(`/uploads/${file.fileName}`, file.fileName)} className="bg-primary/10 p-2 rounded-lg shrink-0 mt-0.5 hover:bg-primary/20 transition-colors cursor-pointer" title="View Document">
-                                                    <FileText className="h-5 w-5 text-primary" />
+                                                <button
+                                                    onClick={() => openViewer(`/uploads/${file.fileName}`, file.fileName)}
+                                                    className="shrink-0 mt-0.5 hover:scale-105 transition-transform cursor-pointer relative group"
+                                                    title="View Document"
+                                                >
+                                                    <FileIcon id={file.fileName} className="h-9 w-9" />
+                                                    <div className="absolute inset-0 bg-primary/20 rounded-md opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                                        <FileText className="h-4 w-4 text-white" />
+                                                    </div>
                                                 </button>
                                                 <div className="min-w-0">
                                                     <button onClick={() => openViewer(`/uploads/${file.fileName}`, file.fileName)} className="font-medium text-sm truncate hover:text-primary hover:underline transition-colors text-left" title={file.fileName}>
@@ -331,6 +497,12 @@ export default function UnprocessedPage() {
                                                             <CalendarIcon className="h-3 w-3" />
                                                             {new Date(file.createdAt).toLocaleString()}
                                                         </span>
+                                                        {file.isDuplicate && (
+                                                            <Badge variant="outline" className="text-[10px] h-4 px-1.5 border-amber-500/50 text-amber-500 bg-amber-500/10 gap-1">
+                                                                <AlertTriangle className="h-2.5 w-2.5" />
+                                                                DUPLICATE
+                                                            </Badge>
+                                                        )}
                                                     </div>
                                                 </div>
                                             </div>

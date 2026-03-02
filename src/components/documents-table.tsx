@@ -85,7 +85,7 @@ export function DocumentsTable({ documents }: DocumentsTableProps) {
             case "documentType": valA = (a.documentType || "").toLowerCase(); valB = (b.documentType || "").toLowerCase(); break
             case "uploadDate": valA = new Date(a.uploadDate).getTime(); valB = new Date(b.uploadDate).getTime(); break
             case "receiptDate": valA = a.date ? new Date(a.date).getTime() : 0; valB = b.date ? new Date(b.date).getTime() : 0; break
-            case "totalAmount": valA = a.extractedItems.reduce((s: number, i: any) => s + (i.amount || 0), 0); valB = b.extractedItems.reduce((s: number, i: any) => s + (i.amount || 0), 0); break
+            case "totalAmount": valA = a.totalAmount || 0; valB = b.totalAmount || 0; break
             case "extractedItemsCount": valA = a.extractedItems.length; valB = b.extractedItems.length; break
             default: valA = 0; valB = 0
         }
@@ -186,7 +186,7 @@ export function DocumentsTable({ documents }: DocumentsTableProps) {
                                 <TableCell suppressHydrationWarning>{new Date(doc.uploadDate).toLocaleDateString()}</TableCell>
                                 <TableCell suppressHydrationWarning>{doc.date ? new Date(doc.date).toLocaleDateString() : "—"}</TableCell>
                                 <TableCell className="text-right font-mono">
-                                    {doc.extractedItems.length > 0 ? `$${doc.extractedItems.reduce((sum: number, i: any) => sum + (i.amount || 0), 0).toFixed(2)}` : "—"}
+                                    {doc.totalAmount !== null ? `$${doc.totalAmount.toFixed(2)}` : "—"}
                                 </TableCell>
                                 <TableCell className="text-right font-medium">{doc.extractedItems.length}</TableCell>
                                 <TableCell className="text-center w-12">

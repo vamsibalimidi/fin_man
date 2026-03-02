@@ -3,6 +3,10 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import fs from "fs/promises";
 import path from "path";
 import { GEMINI_PROMPT } from "@/lib/prompt";
+import { prisma } from "@/lib/db";
+import { calculateHash } from "@/lib/hash-utils";
+import { isMerchantDuplicate } from "@/lib/normalization-utils";
+import { detectConflict } from "@/lib/conflict-utils";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || "");
 const UPLOADS_DIR = path.join(process.cwd(), "public/uploads");
@@ -48,6 +52,8 @@ export async function POST(req: NextRequest) {
             generationConfig: { responseMimeType: "application/json" }
         });
 
+        // Perform the extraction by passing the prompt and file data to the model
+
         const prompt = GEMINI_PROMPT;
 
         const filePart = {
@@ -62,9 +68,14 @@ export async function POST(req: NextRequest) {
         const text = response.text();
         const object = JSON.parse(text);
 
+        // --- CONFLICT DETECTION ---
+        const hash = calculateHash(buffer);
+        const conflict = await detectConflict(hash, object);
+
         return NextResponse.json({
             success: true,
             extractedData: object,
+            conflict,
             fileMeta: {
                 fileName,
                 filePath: `/uploads/${fileName}`,
